@@ -1,0 +1,209 @@
+services:
+  - name: backend
+    type: web
+    env: docker
+    image: frappe/erpnext:v15.52.0
+    envVars:
+      - key: DB_HOST
+        value: db
+      - key: DB_PORT
+        value: "3306"
+      - key: MYSQL_ROOT_PASSWORD
+        value: admin
+      - key: MARIADB_ROOT_PASSWORD
+        value: admin
+    volumes:
+      - name: sites
+        path: /home/frappe/frappe-bench/sites
+      - name: logs
+        path: /home/frappe/frappe-bench/logs
+
+  - name: configurator
+    type: web
+    env: docker
+    image: frappe/erpnext:v15.52.0
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host $$DB_HOST;
+        bench set-config -gp db_port $$DB_PORT;
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+        bench set-config -gp socketio_port $$SOCKETIO_PORT;
+    envVars:
+      - key: DB_HOST
+        value: db
+      - key: DB_PORT
+        value: "3306"
+      - key: REDIS_CACHE
+        value: redis-cache:6379
+      - key: REDIS_QUEUE
+        value: redis-queue:6379
+      - key: SOCKETIO_PORT
+        value: "9000"
+    volumes:
+      - name: sites
+        path: /home/frappe/frappe-bench/sites
+      - name: logs
+        path: /home/frappe/frappe-bench/logs
+
+  - name: create-site
+    type: web
+    env: docker
+    image: frappe/erpnext:v15.52.0
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - >
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        export start=`date +%s`;
+        until [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".db_host // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_cache // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_queue // empty"` ]];
+        do
+          echo "Waiting for sites/common_site_config.json to be created";
+          sleep 5;
+          if (( `date +%s`-start > 120 )); then
+            echo "could not find sites/common_site_config.json with required keys";
+            exit 1
+          fi
+        done;
+        echo "sites/common_site_config.json found";
+        bench new-site --mariadb-user-host-login-scope='%' --admin-password=admin --db-root-username=root --db-root-password=admin --install-app erpnext --set-default frontend;
+    volumes:
+      - name: sites
+        path: /home/frappe/frappe-bench/sites
+      - name: logs
+        path: /home/frappe/frappe-bench/logs
+
+  - name: db
+    type: web
+    env: docker
+    image: mariadb:10.6
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    envVars:
+      - key: MYSQL_ROOT_PASSWORD
+        value: admin
+      - key: MARIADB_ROOT_PASSWORD
+        value: admin
+    volumes:
+      - name: db-data
+        path: /var/lib/mysql
+
+  - name: frontend
+    type: web
+    env: docker
+    image: frappe/erpnext:v15.52.0
+    command:
+      - nginx-entrypoint.sh
+    envVars:
+      - key: BACKEND
+        value: backend:8000
+      - key: FRAPPE_SITE_NAME_HEADER
+        value: frontend
+      - key: SOCKETIO
+        value: websocket:9000
+      - key: UPSTREAM_REAL_IP_ADDRESS
+        value: 127.0.0.1
+      - key: UPSTREAM_REAL_IP_HEADER
+        value: X-Forwarded-For
+      - key: UPSTREAM_REAL_IP_RECURSIVE
+        value: "off"
+      - key: PROXY_READ_TIMEOUT
+        value: 120
+      - key: CLIENT_MAX_BODY_SIZE
+        value: 50m
+    volumes:
+      - name: sites
+        path: /home/frappe/frappe-bench/sites
+      - name: logs
+        path: /home/frappe/frappe-bench/logs
+    ports:
+      - name: http
+        port: 8080
+
+  - name: queue-long
+    type: web
+    env: docker
+    image: frappe/erpnext:v15.52.0
+    command:
+      - bench
+      - worker
+      - --queue
+      - long,default,short
+    volumes:
+      - name: sites
+        path: /home/frappe/frappe-bench/sites
+      - name: logs
+        path: /home/frappe/frappe-bench/logs
+
+  - name: queue-short
+    type: web
+    env: docker
+    image: frappe/erpnext:v15.52.0
+    command:
+      - bench
+      - worker
+      - --queue
+      - short,default
+    volumes:
+      - name: sites
+        path: /home/frappe/frappe-bench/sites
+      - name: logs
+        path: /home/frappe/frappe-bench/logs
+
+  - name: redis-queue
+    type: web
+    env: docker
+    image: redis:6.2-alpine
+    volumes:
+      - name: redis-queue-data
+        path: /data
+
+  - name: redis-cache
+    type: web
+    env: docker
+    image: redis:6.2-alpine
+
+  - name: scheduler
+    type: web
+    env: docker
+    image: frappe/erpnext:v15.52.0
+    command:
+      - bench
+      - schedule
+    volumes:
+      - name: sites
+        path: /home/frappe/frappe-bench/sites
+      - name: logs
+        path: /home/frappe/frappe-bench/logs
+
+  - name: websocket
+    type: web
+    env: docker
+    image: frappe/erpnext:v15.52.0
+    command:
+      - node
+      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+    volumes:
+      - name: sites
+        path: /home/frappe/frappe-bench/sites
+      - name: logs
+        path: /home/frappe/frappe-bench/logs
+
+volumes:
+  - name: db-data
+  - name: redis-queue-data
+  - name: sites
+  - name: logs
